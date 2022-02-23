@@ -18,8 +18,8 @@ def main():
     Main function to spawn the train and test process.
     """
     args = parse_args()
-    if args.num_shards > 1:
-       args.output_dir = str(args.job_dir)
+    # if args.num_shards > 1:
+    #    args.output_dir = str(args.job_dir)
     cfg = load_config(args)
 
     train, test = get_func(cfg)
