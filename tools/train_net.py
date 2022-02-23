@@ -6,6 +6,8 @@ import numpy as np
 import pprint
 import torch
 from fvcore.nn.precise_bn import get_bn_modules, update_bn_stats
+from torch.cuda.amp import autocast, GradScaler
+import contextlib
 
 import timesformer.models.losses as losses
 import timesformer.models.optimizer as optim
@@ -27,7 +29,7 @@ logger = logging.get_logger(__name__)
 
 
 def train_epoch(
-    train_loader, model, optimizer, train_meter, cur_epoch, cfg, writer=None
+    train_loader, model, optimizer, scaler, train_meter, cur_epoch, cfg, writer=None
 ):
     """
     Perform the video training for one epoch.
@@ -50,6 +52,11 @@ def train_epoch(
 
     cur_global_batch_size = cfg.NUM_SHARDS * cfg.TRAIN.BATCH_SIZE
     num_iters = cfg.GLOBAL_BATCH_SIZE // cur_global_batch_size
+
+    if cur_global_batch_size < cfg.GLOBAL_BATCH_SIZE:
+        logger.info("Gradient accumulation enabled!")
+        logger.info(f"cur_global_batch_size: {cur_global_batch_size}, target_global_batch_size: {cfg.GLOBAL_BATCH_SIZE}")
+
 
     for cur_iter, (inputs, labels, _, meta) in enumerate(train_loader):
         # Transfer the data to the current GPU device.
@@ -84,36 +91,91 @@ def train_epoch(
            inputs, labels = mixup_fn(inputs, labels)
            loss_fun = SoftTargetCrossEntropy()
 
-        if cfg.DETECTION.ENABLE:
-            preds = model(inputs, meta["boxes"])
-        else:
-            preds = model(inputs)
-
-        # Compute the loss.
-        loss = loss_fun(preds, labels)
-
-        if cfg.MIXUP.ENABLED:
-            labels = hard_labels
-
-        # check Nan Loss.
-        misc.check_nan_losses(loss)
-
 
         if cur_global_batch_size >= cfg.GLOBAL_BATCH_SIZE:
-            # Perform the backward pass.
+            with autocast(cfg.SOLVER.USE_MIXED_PRECISION):
+                preds = model(inputs)
+                loss = loss_fun(preds, labels)
+            
             optimizer.zero_grad()
-            loss.backward()
-            # Update the parameters.
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        
         else:
             if cur_iter == 0:
                 optimizer.zero_grad()
-            loss.backward()
+            
+            if (cur_iter + 1) % num_iters != 0:
+                if cur_iter < num_iters:
+                    logger.info(f"{cur_iter + 1}/{data_size}. Accumulation forward")
+                
+                no_sync_context_if_ddp = model.no_sync if hasattr(model, "no_sync") else contextlib.nullcontext
+                with no_sync_context_if_ddp():
+                    with autocast(cfg.SOLVER.USE_MIXED_PRECISION):
+                        preds = model(inputs)
+                        loss = loss_fun(preds, labels)
+                    
+                    # no synchronization, accumulate grads
+                    scaler.scale(loss).backward()
+            
             if (cur_iter + 1) % num_iters == 0:
-                for p in model.parameters():
-                    p.grad /= num_iters
-                optimizer.step()
+                if cur_iter < num_iters:
+                    logger.info(f"{cur_iter + 1}/{data_size}. Update forward")
+                with autocast(cfg.SOLVER.USE_MIXED_PRECISION):
+                    preds = model(inputs)
+                    loss = loss_fun(preds, labels)
+
+                # synchronize grads
+                scaler.scale(loss).backward()
+
+                # unscale gradients for mixed precision
+                scaler.unscale_(optimizer)
+
+                # scale gradients so that correct lr@GLOBAL_BATCH_SIZE is applied.
+                with torch.no_grad():
+                    for name, param in model.named_parameters():
+                        if param.grad is None:
+                            if cur_iter < num_iters:
+                                logger.info(f"Skipping a param {name}")
+                        else:
+                            if cur_iter < num_iters:
+                                logger.info(f"Scaling a param {name}'s grad by 1/{num_iters}")
+                            param.grad /= num_iters
+
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
+
+        # if cfg.DETECTION.ENABLE:
+        #     preds = model(inputs, meta["boxes"])
+        # else:
+        #     preds = model(inputs)
+
+        # Compute the loss.
+        # loss = loss_fun(preds, labels)
+
+        # if cfg.MIXUP.ENABLED:
+        #     labels = hard_labels
+
+        # check Nan Loss.
+        # misc.check_nan_losses(loss)
+
+        # if cur_global_batch_size >= cfg.GLOBAL_BATCH_SIZE:
+        #     # Perform the backward pass.
+        #     optimizer.zero_grad()
+        #     loss.backward()
+        #     # Update the parameters.
+        #     optimizer.step()
+        # else:
+        #     if cur_iter == 0:
+        #         optimizer.zero_grad()
+        #     loss.backward()
+        #     if (cur_iter + 1) % num_iters == 0:
+        #         for p in model.parameters():
+        #             p.grad /= num_iters
+        #         optimizer.step()
+        #         optimizer.zero_grad()
 
         if cfg.DETECTION.ENABLE:
             if cfg.NUM_GPUS > 1:
@@ -225,7 +287,8 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writer=None):
 
         if cfg.DETECTION.ENABLE:
             # Compute the predictions.
-            preds = model(inputs, meta["boxes"])
+            with autocast(cfg.SOLVER.USE_MIXED_PRECISION):
+                preds = model(inputs, meta["boxes"])
             ori_boxes = meta["ori_boxes"]
             metadata = meta["metadata"]
 
@@ -244,7 +307,8 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writer=None):
             val_meter.update_stats(preds, ori_boxes, metadata)
 
         else:
-            preds = model(inputs)
+            with autocast(cfg.SOLVER.USE_MIXED_PRECISION):
+                preds = model(inputs)
 
             if cfg.DATA.MULTI_LABEL:
                 if cfg.NUM_GPUS > 1:
@@ -414,9 +478,12 @@ def train(cfg):
     # Construct the optimizer.
     optimizer = optim.construct_optimizer(model, cfg)
 
+    # Construct the gradient scaler for AMP
+    scaler = GradScaler(enabled=cfg.SOLVER.USE_MIXED_PRECISION)
+
     # Load a checkpoint to resume training if applicable.
     if not cfg.TRAIN.FINETUNE:
-      start_epoch = cu.load_train_checkpoint(cfg, model, optimizer)
+      start_epoch = cu.load_train_checkpoint(cfg, model, optimizer, scaler)
     else:
       start_epoch = 0
       cu.load_checkpoint(cfg.TRAIN.CHECKPOINT_FILE_PATH, model)
@@ -475,7 +542,7 @@ def train(cfg):
 
         # Train for one epoch.
         train_epoch(
-            train_loader, model, optimizer, train_meter, cur_epoch, cfg, writer
+            train_loader, model, optimizer, scaler, train_meter, cur_epoch, cfg, writer
         )
 
         is_checkp_epoch = cu.is_checkpoint_epoch(
@@ -503,7 +570,7 @@ def train(cfg):
 
         # Save a checkpoint.
         if is_checkp_epoch:
-            cu.save_checkpoint(cfg.OUTPUT_DIR, model, optimizer, cur_epoch, cfg)
+            cu.save_checkpoint(cfg.OUTPUT_DIR, model, optimizer, scaler, cur_epoch, cfg)
         # Evaluate the model on validation set.
         if is_eval_epoch:
             eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writer)

@@ -399,6 +399,8 @@ _C.SOLVER.OPTIMIZING_METHOD = "sgd"
 # Base learning rate is linearly scaled with NUM_SHARDS.
 _C.SOLVER.BASE_LR_SCALE_NUM_SHARDS = False
 
+_C.SOLVER.USE_MIXED_PRECISION = True
+
 # ---------------------------------------------------------------------------- #
 # Misc options
 # ---------------------------------------------------------------------------- #

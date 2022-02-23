@@ -104,7 +104,7 @@ def is_checkpoint_epoch(cfg, cur_epoch, multigrid_schedule=None):
     return (cur_epoch + 1) % cfg.TRAIN.CHECKPOINT_PERIOD == 0
 
 
-def save_checkpoint(path_to_job, model, optimizer, epoch, cfg):
+def save_checkpoint(path_to_job, model, optimizer, scaler, epoch, cfg):
     """
     Save a checkpoint.
     Args:
@@ -127,6 +127,7 @@ def save_checkpoint(path_to_job, model, optimizer, epoch, cfg):
         "epoch": epoch,
         "model_state": normalized_sd,
         "optimizer_state": optimizer.state_dict(),
+        "scaler_state": scaler.state_dict(),
         "cfg": cfg.dump(),
     }
     # Write the checkpoint.
@@ -192,6 +193,7 @@ def load_checkpoint(
     model,
     data_parallel=True,
     optimizer=None,
+    scaler=None,
     inflation=False,
     convert_from_caffe2=False,
     epoch_reset=False,
@@ -395,6 +397,8 @@ def load_checkpoint(
             epoch = checkpoint["epoch"]
             if optimizer:
                 optimizer.load_state_dict(checkpoint["optimizer_state"])
+            if scaler:
+                scaler.load_state_dict(checkpoint["scaler_state"])
         else:
             epoch = -1
     return epoch
@@ -540,7 +544,7 @@ def load_test_checkpoint(cfg, model):
         )
 
 
-def load_train_checkpoint(cfg, model, optimizer):
+def load_train_checkpoint(cfg, model, optimizer, scaler):
     """
     Loading checkpoint logic for training.
     """
@@ -548,7 +552,7 @@ def load_train_checkpoint(cfg, model, optimizer):
         last_checkpoint = get_last_checkpoint(cfg.OUTPUT_DIR)
         logger.info("Load from last checkpoint, {}.".format(last_checkpoint))
         checkpoint_epoch = load_checkpoint(
-            last_checkpoint, model, cfg.NUM_GPUS > 1, optimizer
+            last_checkpoint, model, cfg.NUM_GPUS > 1, optimizer, scaler
         )
         start_epoch = checkpoint_epoch + 1
     elif cfg.TRAIN.CHECKPOINT_FILE_PATH != "":
@@ -558,6 +562,7 @@ def load_train_checkpoint(cfg, model, optimizer):
             model,
             cfg.NUM_GPUS > 1,
             optimizer,
+            scaler,
             inflation=cfg.TRAIN.CHECKPOINT_INFLATE,
             convert_from_caffe2=cfg.TRAIN.CHECKPOINT_TYPE == "caffe2",
             epoch_reset=cfg.TRAIN.CHECKPOINT_EPOCH_RESET,
